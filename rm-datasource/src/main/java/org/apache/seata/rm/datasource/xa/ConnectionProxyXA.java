@@ -16,6 +16,13 @@
  */
 package org.apache.seata.rm.datasource.xa;
 
+import org.apache.seata.acta.ActaContext;
+import org.apache.seata.acta.ActaFailureInjector;
+import org.apache.seata.acta.ActaFailureInjector.FaultPoint;
+import org.apache.seata.acta.ActaRuntime;
+import org.apache.seata.acta.ActaService;
+import org.apache.seata.acta.ActaTiming;
+import org.apache.seata.acta.ActaTypes.Decision;
 import org.apache.seata.common.DefaultValues;
 import org.apache.seata.common.lock.ResourceLock;
 import org.apache.seata.common.util.StringUtils;
@@ -51,6 +58,19 @@ import static org.apache.seata.common.ConfigurationKeys.*;
  *
  */
 public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Holdable {
+
+    /**
+     * Raised when Acta's Figure 3 lines 30-38 publication block (record tid, insert
+     * outbox entries) fails or refuses. Joins the XAException catch in
+     * {@link #close()} so the failure gets the same cleanup and PhaseOne_Failed
+     * report as a failed prepare.
+     */
+    public static class ActaProgressException extends Exception {
+
+        public ActaProgressException(String msg, Throwable cause) {
+            super(msg, cause);
+        }
+    }
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ConnectionProxyXA.class);
 
@@ -193,6 +213,37 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
     public void xaCommit(String xid, long branchId, String applicationData) throws XAException {
         try (ResourceLock ignored = resourceLock.obtain()) {
             XAXid xaXid = XAXidBuilder.build(xid, branchId);
+            String tid = xaXid.toString();
+            ActaTiming.count(ActaTiming.Site.XA_COMMIT_TOTAL);
+
+            // Acta: Figure 4 (finish, phase-2 decision). This overload is the TC-driven commit
+            // path only (ResourceManagerXA.finishBranch, RM callback thread; ActaContext is never
+            // bound here), so xaResource.commit() below IS DB::finishTxn.
+            //
+            // isInstalled() MUST be checked before get(): "not installed" is the normal state for
+            // baseline runs, and this method runs for EVERY XA commit in the process. isPending()
+            // is a second, in-memory guard so branches Acta never saw cost a hash lookup, not an
+            // acta_meta round trip. ActaTiming calls are measurement only.
+            ActaService acta = null;
+            String actaInId = null;
+            if (ActaRuntime.isInstalled(resource.getDbType())) {
+                acta = ActaRuntime.get(resource.getDbType());
+                long t0 = System.nanoTime();
+                boolean pending = acta.isPending(tid);
+                ActaTiming.record(ActaTiming.Site.XA_COMMIT_IS_PENDING, System.nanoTime() - t0);
+                if (pending) {
+                    long t1 = System.nanoTime();
+                    actaInId = acta.resolveInId(tid);
+                    ActaTiming.record(ActaTiming.Site.XA_COMMIT_RESOLVE_IN_ID, System.nanoTime() - t1);
+                }
+            }
+            if (actaInId != null) {
+                long t2 = System.nanoTime();
+                acta.markPhase2Start(actaInId, Decision.COMMIT);
+                ActaTiming.record(ActaTiming.Site.XA_COMMIT_MARK_PHASE2_START, System.nanoTime() - t2);
+                // Crash injection: no-op unless armed. The COMMIT decision is already durable at the TC.
+                ActaFailureInjector.maybeCrash(actaServiceName(), FaultPoint.AFTER_COMMIT_DECIDED_BEFORE_APPLY);
+            }
 
             if (((DataSourceProxyXA) resource).sonataSsiShimEnabled) {
                 releaseHelperTxn(xaXid);
@@ -202,6 +253,12 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
 
             if (((DataSourceProxyXA) resource).sonataShimEnabled) {
                 forgetDummyKey(xaXid);
+            }
+
+            if (actaInId != null) {
+                long t3 = System.nanoTime();
+                acta.markPhase2Done(actaInId, tid, Decision.COMMIT);
+                ActaTiming.record(ActaTiming.Site.XA_COMMIT_MARK_PHASE2_DONE, System.nanoTime() - t3);
             }
 
             releaseIfNecessary();
@@ -216,11 +273,60 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
      */
     public void xaRollback(String xid, long branchId, String applicationData) throws XAException {
         try (ResourceLock ignored = resourceLock.obtain()) {
-            if (this.xaBranchXid != null) {
-                xaRollback(xaBranchXid);
-            } else {
-                XAXid xaXid = XAXidBuilder.build(xid, branchId);
+            // Both branches produce the same tid: XABranchXid.toString() depends only on xid+branchId.
+            XAXid xaXid = this.xaBranchXid != null ? this.xaBranchXid : XAXidBuilder.build(xid, branchId);
+            String tid = xaXid.toString();
+            ActaTiming.count(ActaTiming.Site.XA_ROLLBACK_TOTAL);
+
+            // Acta: Figure 4, phase-2 ABORT, TC-driven ONLY. The shared xaRollback(XAXid) below is
+            // also reached from rollback()/start()/checkTimeout() as a phase-1 local rollback on a
+            // branch that was never prepared -- that path must NOT be marked ABORTING, so the marking
+            // lives here, around the call, not inside the shared method. Guards as in xaCommit.
+            ActaService acta = null;
+            String actaInId = null;
+            if (ActaRuntime.isInstalled(resource.getDbType())) {
+                acta = ActaRuntime.get(resource.getDbType());
+                long t0 = System.nanoTime();
+                boolean pending = acta.isPending(tid);
+                ActaTiming.record(ActaTiming.Site.XA_ROLLBACK_IS_PENDING, System.nanoTime() - t0);
+                if (pending) {
+                    long t1 = System.nanoTime();
+                    actaInId = acta.resolveInId(tid);
+                    ActaTiming.record(ActaTiming.Site.XA_ROLLBACK_RESOLVE_IN_ID, System.nanoTime() - t1);
+                }
+            }
+            if (actaInId != null) {
+                long t2 = System.nanoTime();
+                acta.markPhase2Start(actaInId, Decision.ABORT);
+                ActaTiming.record(ActaTiming.Site.XA_ROLLBACK_MARK_PHASE2_START, System.nanoTime() - t2);
+                ActaFailureInjector.maybeCrash(actaServiceName(), FaultPoint.AFTER_ABORT_DECIDED_BEFORE_APPLY);
+            }
+
+            // XAER_NOTA on ROLLBACK means the branch no longer exists at the RM (never prepared and
+            // discarded by the DB's own crash recovery, or already rolled back). The abort IS applied,
+            // so Figure 4's terminal state must still be recorded (Assumption A6: finishTxn is idempotent), otherwise
+            // the inbox entry stays at
+            // ABORTING forever and is never GC'd. Only XAER_NOTA is terminal; transient codes are
+            // left for the TC to retry. The exception is always rethrown: Seata's protocol is unchanged.
+            try {
                 xaRollback(xaXid);
+            } catch (XAException e) {
+                if (actaInId != null && e.errorCode == XAException.XAER_NOTA) {
+                    long tNota = System.nanoTime();
+                    acta.markPhase2Done(actaInId, tid, Decision.ABORT);
+                    ActaTiming.record(ActaTiming.Site.XA_ROLLBACK_MARK_PHASE2_DONE, System.nanoTime() - tNota);
+                    LOGGER.info(
+                            "Acta phase2 ABORTED for {} on XAER_NOTA: branch {} no longer exists at the RM",
+                            actaInId,
+                            tid);
+                }
+                throw e;
+            }
+
+            if (actaInId != null) {
+                long t3 = System.nanoTime();
+                acta.markPhase2Done(actaInId, tid, Decision.ABORT);
+                ActaTiming.record(ActaTiming.Site.XA_ROLLBACK_MARK_PHASE2_DONE, System.nanoTime() - t3);
             }
         }
     }
@@ -375,6 +481,8 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
         if (!xaActive || this.xaBranchXid == null) {
             throw new SQLException("should NOT rollback on an inactive session");
         }
+        final String actaInId = ActaContext.getInId();
+        final boolean actaEnabled = actaInId != null && ActaRuntime.isInstalled(resource.getDbType());
         try {
             if (!rollBacked) {
                 try {
@@ -397,8 +505,15 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
                     LOGGER.debug("Ignore XA rollback on an already closed MySQL connection", e);
                 }
             }
-            // Branch Report to TC
+            // Branch Report to TC. Phase-1 local failure (branch never prepared): the xaRollback(XAXid)
+            // above must NOT run Acta's phase-2 marking (see the TC-driven overload). VOTING/VOTED as in close().
+            if (actaEnabled) {
+                ActaRuntime.get(resource.getDbType()).markNoVoting(actaInId);
+            }
             reportStatusToTC(BranchStatus.PhaseOne_Failed);
+            if (actaEnabled) {
+                ActaRuntime.get(resource.getDbType()).markNoVoted(actaInId);
+            }
             LOGGER.info("{} was rollbacked", xaBranchXid);
         } catch (XAException xe) {
             throw new SQLException(
@@ -425,8 +540,16 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
                 // the framework layer does not actively call ROLLBACK when setAutoCommit throws an SQL exception
                 xaResource.end(this.xaBranchXid, XAResource.TMFAIL);
                 xaRollback(xaBranchXid);
-                // Branch Report to TC: Failed
+                // Branch Report to TC: Failed. VOTING/VOTED as in close() and rollback().
+                String actaInId = ActaContext.getInId();
+                boolean actaEnabled = actaInId != null && ActaRuntime.isInstalled(resource.getDbType());
+                if (actaEnabled) {
+                    ActaRuntime.get(resource.getDbType()).markNoVoting(actaInId);
+                }
                 reportStatusToTC(BranchStatus.PhaseOne_Failed);
+                if (actaEnabled) {
+                    ActaRuntime.get(resource.getDbType()).markNoVoted(actaInId);
+                }
                 throw e;
             }
         }
@@ -461,8 +584,13 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
             if (combine) {
                 return;
             }
+            // Acta: bound by the RPC entry point before this branch's connection is closed; null for
+            // any branch without an Acta activation (baselines). "Not installed" is normal, never an error.
+            final String actaInId = ActaContext.getInId();
+            final boolean actaEnabled = actaInId != null && ActaRuntime.isInstalled(resource.getDbType());
             try {
                 if (xaActive && this.xaBranchXid != null) {
+                    ActaTiming.count(ActaTiming.Site.COMMIT_TOTAL);
                     if (((DataSourceProxyXA) resource).sonataShimEnabled) {
                         sonataPrePrepare();
                     }
@@ -485,7 +613,41 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
                                 sqle);
                     }
                     setPrepareTime(now);
+
+                    // Acta: Figure 3 lines 30-38 (publication), AFTER Sonata's dummy write and end(TMSUCCESS), BEFORE
+                    // xaResource.prepare(). A crash between here and prepare leaves a progress record
+                    // for a branch that is not prepared -- recovery re-executes, which is correct.
+                    // Persisting after prepare would leave a prepared branch with no record, and
+                    // recovery would reprocess an input whose local transaction actually survived.
+                    if (actaEnabled) {
+                        String actaTid = xaBranchXid.toString();
+                        boolean actaOk;
+                        long actaT0 = System.nanoTime();
+                        try {
+                            actaOk = ActaRuntime.get(resource.getDbType())
+                                    .recordProgress(actaInId, actaTid, ActaContext.getOutputs());
+                        } catch (RuntimeException e) {
+                            ActaTiming.record(ActaTiming.Site.COMMIT_RECORD_PROGRESS, System.nanoTime() - actaT0);
+                            throw new ActaProgressException("Acta progress persist failed for " + actaTid, e);
+                        }
+                        ActaTiming.record(ActaTiming.Site.COMMIT_RECORD_PROGRESS, System.nanoTime() - actaT0);
+                        if (!actaOk) {
+                            throw new ActaProgressException(
+                                    "Acta input " + actaInId + " is already aborting/aborted, refusing to prepare",
+                                    null);
+                        }
+                        // Crash injection: progress is durable, prepare has not run -> DB crash recovery
+                        // rolls the branch back, leaving a stale-tid outbox row.
+                        ActaFailureInjector.maybeCrash(
+                                actaServiceName(), FaultPoint.AFTER_OUTPUT_PERSIST_BEFORE_DELIVER);
+                    }
+
                     int prepare = xaResource.prepare(xaBranchXid);
+
+                    // Crash injection: prepare durably succeeded, nothing downstream has run yet.
+                    if (actaEnabled) {
+                        ActaFailureInjector.maybeCrash(actaServiceName(), FaultPoint.AFTER_PREPARE_BEFORE_VOTE);
+                    }
                     // Based on the four databases: MySQL (8), Oracle (12c), Postgres (16), and MSSQL Server (2022),
                     // only Oracle has read-only optimization; the others do not provide read-only feedback.
                     // Therefore, the database type check can be eliminated here.
@@ -494,7 +656,20 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
                         reportStatusToTC(BranchStatus.PhaseOne_RDONLY);
                     }
                 }
-            } catch (XAException xe) {
+            } catch (XAException | ActaProgressException xe) {
+                if (xe instanceof ActaProgressException) {
+                    // The branch was ended (TMSUCCESS) but never prepared. Discard it with XA ROLLBACK first:
+                    // MySQL rejects a plain ROLLBACK while the XA branch is IDLE, which would throw out of
+                    // this catch and skip the PhaseOne_Failed report below.
+                    try {
+                        xaResource.rollback(xaBranchXid);
+                    } catch (XAException rollbackFailure) {
+                        LOGGER.warn(
+                                "Acta: XA rollback of unprepared branch {} failed: {}",
+                                xaBranchXid,
+                                rollbackFailure.getMessage());
+                    }
+                }
                 // Some drivers (e.g., PG) do not automatically roll back and reset autocommit when failing to prepare,
                 // which would cause the later reuse of the connection to fail at init(). Thus, we do it manually.
                 // The Seata 2.0.0 patch applied this cleanup only to PostgreSQL. It was later generalized to all
@@ -515,8 +690,16 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
                     forgetDummyKey(xaBranchXid);
                 }
 
-                // Branch Report to TC: Failed
+                // Branch Report to TC: Failed. VOTING-before / VOTED-after (abortAndVote, Figure 3
+                // lines 47-55): recoverInput's noVote==VOTING branch resends a no vote that may not have
+                // reached the TC, which is dead code unless VOTING is actually recorded before the send.
+                if (actaEnabled) {
+                    ActaRuntime.get(resource.getDbType()).markNoVoting(actaInId);
+                }
                 reportStatusToTC(BranchStatus.PhaseOne_Failed);
+                if (actaEnabled) {
+                    ActaRuntime.get(resource.getDbType()).markNoVoted(actaInId);
+                }
                 throw new SQLException(
                         "Failed to end(TMSUCCESS)/prepare xa branch on " + xid + "-" + xaBranchXid.getBranchId()
                                 + " since " + xe.getMessage(),
@@ -590,6 +773,11 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
      *
      * @param status branch status
      */
+    /** Service label used by ActaFailureInjector to scope crash points to one branch type. */
+    private String actaServiceName() {
+        return DBType.MYSQL.name().equalsIgnoreCase(resource.getDbType()) ? "mysql-branch" : "pg-branch";
+    }
+
     private void reportStatusToTC(BranchStatus status) {
         try {
             DefaultResourceManager.get().branchReport(BranchType.XA, xid, xaBranchXid.getBranchId(), status, null);
