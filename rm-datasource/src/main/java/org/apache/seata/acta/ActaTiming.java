@@ -30,8 +30,20 @@ public final class ActaTiming {
         XA_COMMIT_RESOLVE_IN_ID,
         /** xaCommit()'s ActaService.markPhase2Start() call, timed only when actaInId was resolved. */
         XA_COMMIT_MARK_PHASE2_START,
-        /** xaCommit()'s ActaService.markPhase2Done() call, timed only when actaInId was resolved. */
+        /**
+         * xaCommit()'s ActaService.markPhase2Done() call, timed only when actaInId was resolved.
+         * Since markPhase2Done became asynchronous (paper 3.7: COMMITTED/ABORTED is off the
+         * critical path) this measures the ENQUEUE, which is what the commit path actually pays.
+         * The durable write it hands off is XA_COMMIT_MARK_PHASE2_DONE_ASYNC below.
+         */
         XA_COMMIT_MARK_PHASE2_DONE,
+        /**
+         * The acta_meta write markPhase2Done(COMMIT) hands to the background executor, timed on
+         * that executor's thread and counted once per enqueued write, failures included. Paired
+         * with XA_COMMIT_MARK_PHASE2_DONE: the two counts stay equal, and the difference between
+         * their averages is exactly what moving the write off the critical path bought.
+         */
+        XA_COMMIT_MARK_PHASE2_DONE_ASYNC,
 
         /** Every ConnectionProxyXA.xaRollback(xid, branchId, data) invocation, Acta-relevant or not -- the reach denominator. */
         XA_ROLLBACK_TOTAL,
@@ -41,8 +53,10 @@ public final class ActaTiming {
         XA_ROLLBACK_RESOLVE_IN_ID,
         /** xaRollback()'s ActaService.markPhase2Start() call, timed only when actaInId was resolved. */
         XA_ROLLBACK_MARK_PHASE2_START,
-        /** xaRollback()'s ActaService.markPhase2Done() call, timed only when actaInId was resolved. */
+        /** xaRollback()'s ActaService.markPhase2Done() enqueue -- see XA_COMMIT_MARK_PHASE2_DONE. */
         XA_ROLLBACK_MARK_PHASE2_DONE,
+        /** The acta_meta write markPhase2Done(ABORT) hands off -- see XA_COMMIT_MARK_PHASE2_DONE_ASYNC. */
+        XA_ROLLBACK_MARK_PHASE2_DONE_ASYNC,
 
         /** Every ConnectionProxyXA.commit() invocation that reaches the Acta hook site, Acta-relevant or not -- the reach denominator. */
         COMMIT_TOTAL,
@@ -59,9 +73,10 @@ public final class ActaTiming {
         ACTIVATION_TOTAL,
 
         /**
-         * Every ActaMetadata.atomic() call: one acta_meta transaction, i.e. one
-         * connection checkout from the DEDICATED metadata pool plus a
-         * begin/commit round trip. Instrumented centrally in atomic() rather
+         * Every ActaMetadata.atomic() or single() call: one acta_meta round
+         * trip, i.e. one connection checkout from the DEDICATED metadata pool
+         * plus either a begin/commit-wrapped block or one self-committing
+         * statement. Instrumented centrally in those two methods rather
          * than at each call site because every inbox/outbox/epoch/watermark
          * operation goes through it, so count/ACTIVATION_TOTAL is the measured
          * "acta_meta round trips per hop" figure directly.

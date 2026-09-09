@@ -22,9 +22,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -63,21 +66,80 @@ public final class ActaService {
     }
 
     /**
-     * In-memory pre-filter for tids Acta has recorded progress for, so
-     * ConnectionProxyXA.xaCommit()/xaRollback() -- which run on Seata's RM
-     * callback thread for EVERY branch in the process, Acta-driven or not --
-     * can skip resolveInId's acta_meta round trip for the common case of a
-     * branch Acta was never told about. A concurrent set: xaCommit/xaRollback
-     * run on RM threads while recordProgress runs on request threads.
+     * In-memory tid -> input message id map for the tids Acta has recorded
+     * progress for. It does two jobs:
+     *
+     *  - the pre-filter {@link #isPending} already did: ConnectionProxyXA's
+     *    xaCommit()/xaRollback() run on Seata's RM callback thread for EVERY
+     *    branch in the process, Acta-driven or not, so a branch Acta was never
+     *    told about must cost a hash lookup, not an acta_meta round trip;
+     *  - {@link #resolveInId}, which used to BE that round trip. Measured at
+     *    concurrency 4, XA_COMMIT_RESOLVE_IN_ID was 8.1 ms per commit while
+     *    pg_test_fsync puts one fsync at 0.17 ms, so the cost was JDBC round
+     *    trips, not durability, and a map lookup removes it outright.
+     *
+     * The acta_meta lookup remains as the fallback on a miss, so correctness
+     * never depends on this map being populated -- only speed does.
      *
      * Keyed on exactly the string resolveInId takes (the branch's
      * XAXid.toString()); recordProgress adds the identical value it is
      * called with, which ConnectionProxyXA.commit() sources from the same
      * xaBranchXid.toString(). A mismatched key format here would make every
      * lookup miss and silently disable phase-2 tracking, not just the
-     * optimization.
+     * optimization. Concurrent because xaCommit/xaRollback run on RM threads
+     * while recordProgress runs on request threads.
      */
-    private final Set<String> pendingTids = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<String, String> inIdByTid = new ConcurrentHashMap<>();
+
+    /**
+     * The reverse direction, inId -> the tid CURRENTLY recorded for it. Not a
+     * convenience: it is what keeps {@link #inIdByTid} faithful to the database.
+     *
+     * recordProgress OVERWRITES acta_inbox.tid, so after a re-execution the old
+     * tid matches no row at all and getInboxByTid(oldTid) returns null. That is
+     * precisely why a phase-2 callback arriving for a stale, rolled-back branch
+     * marks nothing today -- the same "tid mismatch means not ours" rule
+     * deliver() applies explicitly at Figure 4 line 78. A tid -> inId cache that
+     * kept the superseded entry would instead answer that callback with a LIVE
+     * inId and let it drive markPhase2Start on an activation that is currently
+     * re-executing, turning a lookup miss into a wrong write. So every
+     * recordProgress evicts the inId's previous tid, which restores the
+     * "stale tid resolves to nothing" behaviour the database gave for free.
+     */
+    private final ConcurrentHashMap<String, String> tidByInId = new ConcurrentHashMap<>();
+
+    /** How long {@link #shutdown()} waits for queued phase-2 writes before giving up. */
+    private static final long PHASE2_DRAIN_TIMEOUT_S = 30L;
+
+    /**
+     * Single-threaded, per-service executor for the terminal COMMITTED/ABORTED
+     * write (paper 3.7: those are off the critical path -- unlike
+     * markPhase2Start's COMMITTING/ABORTING, which Figure 3 requires to be
+     * durable BEFORE the DB call and therefore stays synchronous).
+     *
+     * Single-threaded on purpose, not for throughput: it keeps the writes for
+     * one service in enqueue order and bounds the extra load this puts on the
+     * metadata pool to one connection, which invariant 1 sizes for.
+     *
+     * <h2>Why losing a queued write is safe</h2>
+     *
+     * A crash drops whatever is still queued, leaving those entries at
+     * COMMITTING/ABORTING rather than COMMITTED/ABORTED. That is a state
+     * recovery already tolerates and is already reached by other means -- it is
+     * exactly what a crash between markPhase2Start and the DB call leaves
+     * behind, which is the AFTER_COMMIT_DECIDED_BEFORE_APPLY crash-matrix
+     * scenario. recoverInput SKIPs any entry with a non-null phase2 (Figure 7
+     * line 150: the coordinator has already decided, so recovery must not
+     * re-execute), and the TC's own retry scan then redelivers branchCommit /
+     * branchRollback, which runs the phase-2 path again and re-enqueues the
+     * terminal write. So recoverAll never needs to know whether a previous
+     * incarnation had writes in flight: they went away with the JVM, and the
+     * state they would have produced is reached again by redelivery.
+     *
+     * The only thing a lost write costs is GC latency -- tryGcInbox collects
+     * only terminal entries -- never correctness.
+     */
+    private final ExecutorService phase2DoneExecutor;
 
     public ActaService(
             String serviceId, ActaMetadata meta, XaOps xa, TwoPcClient twoPc, Handler handler, Transport transport) {
@@ -87,24 +149,90 @@ public final class ActaService {
         this.twoPc = twoPc;
         this.handler = handler;
         this.transport = transport;
+        this.phase2DoneExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "acta-phase2-done-" + serviceId);
+            t.setDaemon(true);
+            return t;
+        });
+        // Daemon threads do not keep the JVM alive, so a graceful shutdown needs
+        // this to flush what is queued. A crash (ActaFailureInjector's
+        // Runtime.halt, invariant 6) deliberately runs no hook at all -- see
+        // phase2DoneExecutor's Javadoc for why the dropped writes are safe.
+        Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "acta-phase2-done-drain-" + serviceId));
         primePendingTids();
     }
 
     /**
-     * Figure 6 prerequisite for the pre-filter above: after a crash, prepared
+     * Stop accepting new phase-2 writes and drain the queued ones. Idempotent.
+     * Registered as a JVM shutdown hook by the constructor; also safe to call
+     * directly from an owning container's lifecycle callback.
+     */
+    public void shutdown() {
+        phase2DoneExecutor.shutdown();
+        try {
+            if (!phase2DoneExecutor.awaitTermination(PHASE2_DRAIN_TIMEOUT_S, TimeUnit.SECONDS)) {
+                LOGGER.warn(
+                        "Acta phase-2 writes still queued for {} after {}s; the remaining entries stay at "
+                                + "COMMITTING/ABORTING and are resolved by TC redelivery after restart",
+                        serviceId,
+                        PHASE2_DRAIN_TIMEOUT_S);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Figure 6 prerequisite for the maps above: after a crash, prepared
      * branches exist that the TC will still drive xaCommit/xaRollback for, but
-     * pendingTids starts empty on a fresh instance. Without this, a recovering
+     * both maps start empty on a fresh instance. Without this, a recovering
      * branch's phase-2 callback would look like "not Acta's", skip
      * markPhase2Done, and leave phase2 NULL forever -- tryGcInbox never
      * collects that entry. Runs from the constructor so there is no window
-     * between construction and use where the set could be consulted unprimed.
+     * between construction and use where the maps could be consulted unprimed.
+     *
+     * Rebuilds inIdByTid from the same rows and under the same condition that
+     * populated it before the crash: an inbox row carrying a tid, not yet in a
+     * terminal phase2. The row IS the record recordProgress wrote, so priming
+     * from it reproduces exactly the mapping the previous incarnation held.
      */
     private void primePendingTids() {
-        List<InboxEntry> entries = meta.atomic(ActaMetadata::listInbox);
+        List<InboxEntry> entries = meta.single(ActaMetadata::listInbox);
         for (InboxEntry e : entries) {
             if (e.tid != null && e.phase2 != Phase2.COMMITTED && e.phase2 != Phase2.ABORTED) {
-                pendingTids.add(e.tid);
+                rememberTid(e.msg.id, e.tid);
             }
+        }
+    }
+
+    /**
+     * Record tid as the current tid for inId, evicting whatever tid was
+     * previously recorded for that inId -- see {@link #tidByInId}'s Javadoc for
+     * why that eviction is a correctness requirement and not housekeeping.
+     */
+    private void rememberTid(String inId, String tid) {
+        String previous = tidByInId.put(inId, tid);
+        if (previous != null && !previous.equals(tid)) {
+            inIdByTid.remove(previous);
+        }
+        inIdByTid.put(tid, inId);
+    }
+
+    /**
+     * Drop a tid that can receive no further phase-2 callback. Package-private
+     * so ActaRecovery.tryGcInbox can call it after deleting an inbox row:
+     * a deleted row cannot be found by getInboxByTid either, so leaving the
+     * mapping behind would let the cache answer where the database would not.
+     * Removes the reverse entry only if it still points at this tid, so a
+     * concurrent re-execution's newer tid is never unmapped.
+     */
+    void forgetTid(String inId, String tid) {
+        if (tid == null) {
+            return;
+        }
+        inIdByTid.remove(tid);
+        if (inId != null) {
+            tidByInId.remove(inId, tid);
         }
     }
 
@@ -250,8 +378,9 @@ public final class ActaService {
         });
         if (ok) {
             // Marks this tid as Acta's, so xaCommit/xaRollback's pre-filter lets
-            // its eventual phase-2 callback through to resolveInId.
-            pendingTids.add(tid);
+            // its eventual phase-2 callback through, and records the tid -> inId
+            // direction so resolveInId can answer it without a round trip.
+            rememberTid(inId, tid);
         }
         return ok;
     }
@@ -262,7 +391,7 @@ public final class ActaService {
      * acta_meta round trip -- see pendingTids' Javadoc for why this exists.
      */
     public boolean isPending(String tid) {
-        return pendingTids.contains(tid);
+        return inIdByTid.containsKey(tid);
     }
 
     /** VOTING mark before a no vote is sent. Paired with {@link #markNoVoted}. */
@@ -292,7 +421,14 @@ public final class ActaService {
      * where ActaContext is bound).
      */
     public String resolveInId(String tid) {
-        InboxEntry e = meta.atomic(c -> ActaMetadata.getInboxByTid(c, tid));
+        String cached = inIdByTid.get(tid);
+        if (cached != null) {
+            return cached;
+        }
+        // Miss: the map is a cache, never the source of truth. A miss is normal
+        // for a branch Acta never recorded, and the acta_meta lookup is what
+        // still answers correctly if the map were ever incomplete.
+        InboxEntry e = meta.single(c -> ActaMetadata.getInboxByTid(c, tid));
         return e == null ? null : e.msg.id;
     }
 
@@ -421,14 +557,50 @@ public final class ActaService {
      * markPhase2Start), in which case there is nothing to remove.
      */
     public void markPhase2Done(String inId, String tid, Decision decision) {
-        meta.atomic(c -> {
-            if (ActaMetadata.getInbox(c, inId) != null) {
-                ActaMetadata.setPhase2(c, inId, decision == Decision.COMMIT ? Phase2.COMMITTED : Phase2.ABORTED);
-            }
-            return null;
-        });
-        if (tid != null) {
-            pendingTids.remove(tid);
+        // In-memory bookkeeping stays synchronous: it costs nothing and keeps
+        // the pre-filter tight no matter when the durable write lands.
+        forgetTid(inId, tid);
+        try {
+            phase2DoneExecutor.execute(() -> writePhase2Done(inId, decision));
+        } catch (RejectedExecutionException e) {
+            // The executor is already shutting down. Write inline rather than
+            // drop it, so a graceful shutdown still records what it can.
+            writePhase2Done(inId, decision);
+        }
+    }
+
+    /**
+     * The atomic block {@link #markPhase2Done} hands to the executor. Identical
+     * to what it used to run inline; only the thread it runs on changed.
+     *
+     * Failures are logged at WARN and swallowed: there is no caller left to
+     * propagate to (the RM callback thread returned long ago), and the entry
+     * simply stays at COMMITTING/ABORTING, which recovery and TC redelivery
+     * already resolve -- see {@link #phase2DoneExecutor}'s Javadoc.
+     */
+    private void writePhase2Done(String inId, Decision decision) {
+        long startNanos = System.nanoTime();
+        try {
+            meta.atomic(c -> {
+                if (ActaMetadata.getInbox(c, inId) != null) {
+                    ActaMetadata.setPhase2(c, inId, decision == Decision.COMMIT ? Phase2.COMMITTED : Phase2.ABORTED);
+                }
+                return null;
+            });
+        } catch (RuntimeException e) {
+            LOGGER.warn(
+                    "Acta markPhase2Done write failed for inId={} decision={} on service={}; entry stays at "
+                            + "COMMITTING/ABORTING until TC redelivery re-runs phase 2",
+                    inId,
+                    decision,
+                    serviceId,
+                    e);
+        } finally {
+            ActaTiming.record(
+                    decision == Decision.COMMIT
+                            ? ActaTiming.Site.XA_COMMIT_MARK_PHASE2_DONE_ASYNC
+                            : ActaTiming.Site.XA_ROLLBACK_MARK_PHASE2_DONE_ASYNC,
+                    System.nanoTime() - startNanos);
         }
     }
 
@@ -452,7 +624,7 @@ public final class ActaService {
                 throw new IllegalStateException(
                         "deliver retry budget exhausted for " + msg.msg.id + " (test-only baseline arm)");
             }
-            InboxEntry in = meta.atomic(c -> ActaMetadata.getInbox(c, msg.inId));
+            InboxEntry in = meta.single(c -> ActaMetadata.getInbox(c, msg.inId));
 
             // Lines 76-78. Each clause is a distinct reason not to transmit:
             //   in == null       -> the outbox entry (and this one) was GC'd;

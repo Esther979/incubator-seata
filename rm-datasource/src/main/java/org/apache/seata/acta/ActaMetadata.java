@@ -63,9 +63,47 @@ public final class ActaMetadata {
         }
     }
 
+    /**
+     * Run ONE statement, with no explicit transaction around it.
+     *
+     * A lone statement is atomic and durable on its own -- see this class's
+     * Javadoc -- so wrapping it in BEGIN/COMMIT buys nothing and costs round
+     * trips. Only the round trips are removed; the statement and its durability
+     * are unchanged.
+     *
+     * Counted as META_ATOMIC exactly like {@link #atomic}, so that site keeps
+     * meaning "one acta_meta round trip" and count/ACTIVATION_TOTAL remains the
+     * measured round-trips-per-hop figure its Javadoc describes.
+     *
+     * Use ONLY for a body that executes exactly one statement. A body that
+     * reads and then writes MUST use {@link #atomic}: without the transaction
+     * those two statements commit separately and another connection can
+     * interleave between them, which would break exactly the read-modify-write
+     * atomicity every phase2 / noVote / watermark guard in this package relies
+     * on.
+     */
+    public <T> T single(TxBody<T> body) {
+        long startNanos = System.nanoTime();
+        try {
+            return single0(body);
+        } finally {
+            ActaTiming.record(ActaTiming.Site.META_ATOMIC, System.nanoTime() - startNanos);
+        }
+    }
+
+    private <T> T single0(TxBody<T> body) {
+        // No setAutoCommit call at all. Hikari hands the connection over in the
+        // pool's configured autoCommit state -- the default true, not overridden
+        // for either acta_meta DataSource -- so the statement self-commits.
+        try (Connection c = metaDs.getConnection()) {
+            return body.run(c);
+        } catch (SQLException e) {
+            throw new RuntimeException("acta metadata failure", e);
+        }
+    }
+
     private <T> T atomic0(TxBody<T> body) {
         try (Connection c = metaDs.getConnection()) {
-            boolean old = c.getAutoCommit();
             c.setAutoCommit(false);
             try {
                 T r = body.run(c);
@@ -77,12 +115,19 @@ public final class ActaMetadata {
                 } catch (SQLException ignored) {
                 }
                 throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
-            } finally {
-                try {
-                    c.setAutoCommit(old);
-                } catch (SQLException ignored) {
-                }
             }
+            // No setAutoCommit(old) restore on purpose. HikariCP already does it
+            // when the connection goes back to the pool: PoolBase.resetConnectionState
+            // (verified against HikariCP 7.0.2, the version on this classpath)
+            // checks the connection's dirty bits and, for autoCommit, compares
+            // ProxyConnection.getAutoCommitState() with the pool's own
+            // isAutoCommit -- HikariConfig.isAutoCommit(), default true and not
+            // overridden for either acta_meta DataSource -- calling
+            // Connection.setAutoCommit(isAutoCommit) only when the two differ.
+            // Restoring it here as well just performed that same reset twice per
+            // block, and on MySQL setAutoCommit is a wire round trip
+            // (SET autocommit=1), not a local flag. Dropping it removes one round
+            // trip per block and cannot leak a dirty flag to the next borrower.
         } catch (SQLException e) {
             throw new RuntimeException("acta metadata failure", e);
         }

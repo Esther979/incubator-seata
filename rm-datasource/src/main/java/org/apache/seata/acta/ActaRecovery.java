@@ -70,7 +70,7 @@ public final class ActaRecovery {
         // current entry. Order matters: the entry may be collected concurrently.
         boolean prepared = in.tid != null && svc.xa().isPrepared(in.tid);
 
-        InboxEntry current = svc.meta().atomic(c -> ActaMetadata.getInbox(c, in.msg.id));
+        InboxEntry current = svc.meta().single(c -> ActaMetadata.getInbox(c, in.msg.id));
 
         if (current == null) {
             // Collected already; normal operation (or a prior recovery pass)
@@ -186,8 +186,8 @@ public final class ActaRecovery {
         // under the wrong engine, which is loud. The inboxTotal/inboxScanned
         // pair below is kept and now always equal -- a divergence between them
         // is itself the signal that a store is shared or mis-wired.
-        List<InboxEntry> owned = svc.meta().atomic(ActaMetadata::listInbox);
-        List<OutboxEntry> ownedOutputs = svc.meta().atomic(ActaMetadata::listAllOutbox);
+        List<InboxEntry> owned = svc.meta().single(ActaMetadata::listInbox);
+        List<OutboxEntry> ownedOutputs = svc.meta().single(ActaMetadata::listAllOutbox);
 
         LOGGER.info(
                 "Acta recoverAll service={} epoch={} inboxScanned={} inboxTotal={} outboxConsidered={} outboxTotal={}",
@@ -262,6 +262,12 @@ public final class ActaRecovery {
             boolean noOutputs = !ActaMetadata.hasOutputsFrom(c, cur.msg.id);
             if (retired && settled && noOutputs) {
                 ActaMetadata.deleteInbox(c, cur.msg.id);
+                // The row is gone, so getInboxByTid can no longer find it either;
+                // drop the in-memory mapping with it so the cache and the
+                // database keep answering the same question the same way. Also
+                // collects the abortAndVote case (noVote VOTED, phase2 still
+                // null), which never reaches markPhase2Done.
+                svc.forgetTid(cur.msg.id, cur.tid);
             }
             return null;
         });
@@ -331,7 +337,7 @@ public final class ActaRecovery {
         for (String t : targets) {
             tryGcOutbox(t);
         }
-        List<InboxEntry> entries = svc.meta().atomic(ActaMetadata::listInbox);
+        List<InboxEntry> entries = svc.meta().single(ActaMetadata::listInbox);
         for (InboxEntry e : entries) {
             tryGcInbox(e);
         }
