@@ -657,6 +657,11 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
                     }
                 }
             } catch (XAException | ActaProgressException xe) {
+                // Logged BEFORE any cleanup, with the cause chain: an ActaProgressException carries the
+                // real failure (a metadata store error, say) as its cause, and every cleanup step below
+                // can throw and mask it.
+                LOGGER.warn("XA branch {} phase-1 failure: {}", xaBranchXid, xe.toString(), xe);
+
                 if (xe instanceof ActaProgressException) {
                     // The branch was ended (TMSUCCESS) but never prepared. Discard it with XA ROLLBACK first:
                     // MySQL rejects a plain ROLLBACK while the XA branch is IDLE, which would throw out of
@@ -675,30 +680,82 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
                 // The Seata 2.0.0 patch applied this cleanup only to PostgreSQL. It was later generalized to all
                 // databases and may be overly broad; keep the current behavior unless an actual failure requires us to
                 // revisit it.
-                originalConnection.rollback();
-                originalConnection.setAutoCommit(true);
+                //
+                // Every cleanup step below is independently guarded, and none of them may prevent the vote
+                // that follows: paper Assumption A9 requires a definitive local failure to produce a no vote,
+                // so an exception thrown while tidying up a branch that is ALREADY rolled back must never
+                // decide whether the TC hears about it. Observed on the cluster: after an
+                // ActaProgressException the XA ROLLBACK above succeeds and leaves the connection in
+                // autocommit, the unguarded rollback() then threw "Can't call rollback when autocommit=true"
+                // (MySQL Connector/J 8.4), the exception escaped this block, and the TC went on to commit a
+                // global transaction whose branch no longer existed. Hence the getAutoCommit() guard as well:
+                // there is nothing to roll back on a connection that never opened a local transaction.
+                try {
+                    if (!originalConnection.getAutoCommit()) {
+                        originalConnection.rollback();
+                    }
+                    originalConnection.setAutoCommit(true);
+                } catch (SQLException cleanupFailure) {
+                    LOGGER.warn(
+                            "XA branch {} connection cleanup (rollback/setAutoCommit) failed, continuing to vote: {}",
+                            xaBranchXid,
+                            cleanupFailure.getMessage(),
+                            cleanupFailure);
+                }
 
                 if (((DataSourceProxyXA) resource).sonataShimEnabled) {
-                    if (((DataSourceProxyXA) resource).sonataSsiShimEnabled) {
-                        try {
-                            releaseHelperTxn(xaBranchXid);
-                        } catch (XAException ignored2) {
-                            // On the RM side, a missing prepared helper txn is only caused by TM-initiated rollback. No
-                            // action needed.
+                    try {
+                        if (((DataSourceProxyXA) resource).sonataSsiShimEnabled) {
+                            try {
+                                releaseHelperTxn(xaBranchXid);
+                            } catch (XAException ignored2) {
+                                // On the RM side, a missing prepared helper txn is only caused by TM-initiated rollback. No
+                                // action needed.
+                            }
                         }
+                        forgetDummyKey(xaBranchXid);
+                    } catch (RuntimeException sonataFailure) {
+                        // XAException cannot reach here: releaseHelperTxn's own catch above absorbs it,
+                        // and forgetDummyKey signals a missing dummy key with a RuntimeException.
+                        LOGGER.warn(
+                                "XA branch {} Sonata shim cleanup failed, continuing to vote: {}",
+                                xaBranchXid,
+                                sonataFailure.getMessage(),
+                                sonataFailure);
                     }
-                    forgetDummyKey(xaBranchXid);
                 }
 
                 // Branch Report to TC: Failed. VOTING-before / VOTED-after (abortAndVote, Figure 3
                 // lines 47-55): recoverInput's noVote==VOTING branch resends a no vote that may not have
                 // reached the TC, which is dead code unless VOTING is actually recorded before the send.
+                //
+                // The two marks are themselves guarded so that neither can skip the report: they are Acta
+                // bookkeeping, while the report IS the no vote A9 demands. Losing a VOTING mark only costs
+                // recoverInput its resend shortcut -- the entry is then found unprepared and re-executed,
+                // which is safe -- whereas losing the report is the failure this whole block exists to
+                // prevent.
                 if (actaEnabled) {
-                    ActaRuntime.get(resource.getDbType()).markNoVoting(actaInId);
+                    try {
+                        ActaRuntime.get(resource.getDbType()).markNoVoting(actaInId);
+                    } catch (RuntimeException markFailure) {
+                        LOGGER.warn(
+                                "Acta: markNoVoting({}) failed, still reporting PhaseOne_Failed: {}",
+                                actaInId,
+                                markFailure.getMessage(),
+                                markFailure);
+                    }
                 }
                 reportStatusToTC(BranchStatus.PhaseOne_Failed);
                 if (actaEnabled) {
-                    ActaRuntime.get(resource.getDbType()).markNoVoted(actaInId);
+                    try {
+                        ActaRuntime.get(resource.getDbType()).markNoVoted(actaInId);
+                    } catch (RuntimeException markFailure) {
+                        LOGGER.warn(
+                                "Acta: markNoVoted({}) failed after the no vote was sent: {}",
+                                actaInId,
+                                markFailure.getMessage(),
+                                markFailure);
+                    }
                 }
                 throw new SQLException(
                         "Failed to end(TMSUCCESS)/prepare xa branch on " + xid + "-" + xaBranchXid.getBranchId()
