@@ -1,5 +1,6 @@
 package org.apache.seata.acta;
 
+import javax.transaction.xa.XAException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,7 +65,20 @@ public final class ActaFailureInjector {
          * The TC already holds a durable ABORT decision; recovery must SKIP,
          * and the TC's own RetryRollbacking scan completes it on reconnect.
          */
-        AFTER_ABORT_DECIDED_BEFORE_APPLY
+        AFTER_ABORT_DECIDED_BEFORE_APPLY,
+        /**
+         * Make {@code xaResource.prepare} FAIL for one branch. Unlike every
+         * other point here this does not crash the process: it raises the
+         * failure the real bug appeared as (a PostgreSQL SSI pivot detected at
+         * PREPARE TRANSACTION), so the phase-1 failure path and its new
+         * visibility marker can be exercised deterministically while the JVM
+         * stays up to answer for it.
+         *
+         * One-shot by construction: {@link #maybeFailPrepare} disarms itself as
+         * it fires, because a surviving process would otherwise fail every
+         * subsequent prepare on that service.
+         */
+        PREPARE_FAILS
     }
 
     private static volatile String armedService;
@@ -118,6 +132,19 @@ public final class ActaFailureInjector {
      * System.exit or any graceful stop; that would roll back the very branch
      * this exists to leave prepared.
      */
+    /**
+     * No-op unless {@code serviceId} is armed for {@link FaultPoint#PREPARE_FAILS}.
+     * On a match, disarms and throws, so the caller's existing phase-1 failure
+     * handling runs exactly as it would for a real prepare failure.
+     */
+    public static void maybeFailPrepare(String serviceId) throws XAException {
+        if (armedPoint == FaultPoint.PREPARE_FAILS && serviceId.equals(armedService)) {
+            LOGGER.info("Acta ActaFailureInjector firing service={} point={}", serviceId, FaultPoint.PREPARE_FAILS);
+            disarm();
+            throw new XAException("ActaFailureInjector: injected PREPARE failure for " + serviceId);
+        }
+    }
+
     public static void maybeCrash(String serviceId, FaultPoint point) {
         if (point == armedPoint && serviceId.equals(armedService)) {
             LOGGER.info("Acta ActaFailureInjector firing service={} point={}", serviceId, point);

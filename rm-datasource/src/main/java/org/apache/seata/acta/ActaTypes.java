@@ -39,7 +39,15 @@ public final class ActaTypes {
         /** Not yet transmitted (or transmission not yet acknowledged as durable). */
         NEW,
         /** Target durably received it. */
-        ACKED
+        ACKED,
+        /**
+         * The target received it and ABORTED the resulting activation (see
+         * ActaActivationAbortedException). Terminal, like ACKED: the message was
+         * not lost, so Figure 5 retransmission does not apply, and the global
+         * transaction it belongs to is being rolled back. Recovery must never
+         * requeue an entry in this state -- see ActaRecovery.recoverAll's Javadoc.
+         */
+        FAILED
     }
 
     /** 2PC decision. */

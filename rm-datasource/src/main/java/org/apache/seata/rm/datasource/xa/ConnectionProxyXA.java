@@ -507,6 +507,14 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
             }
             // Branch Report to TC. Phase-1 local failure (branch never prepared): the xaRollback(XAXid)
             // above must NOT run Acta's phase-2 marking (see the TC-driven overload). VOTING/VOTED as in close().
+            //
+            // Marked for the application thread too, as in close(). Here the application usually DOES see the
+            // failure -- this path runs because its exception propagated -- so the marker is a backstop for the
+            // cases where that exception is swallowed on the way out. ActaContext.unbind() clears it either way.
+            if (actaEnabled) {
+                ActaContext.recordPhase1Failure(xaBranchXid.toString(),
+                        new SQLException("XA branch " + xaBranchXid + " rolled back in phase 1"));
+            }
             if (actaEnabled) {
                 ActaRuntime.get(resource.getDbType()).markNoVoting(actaInId);
             }
@@ -642,6 +650,12 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
                                 actaServiceName(), FaultPoint.AFTER_OUTPUT_PERSIST_BEFORE_DELIVER);
                     }
 
+                    // Test-only: no-op unless armed. Raises the exact failure shape the
+                    // real bug appeared as, so the phase-1 path below runs for real.
+                    if (actaEnabled) {
+                        ActaFailureInjector.maybeFailPrepare(actaServiceName());
+                    }
+
                     int prepare = xaResource.prepare(xaBranchXid);
 
                     // Crash injection: prepare durably succeeded, nothing downstream has run yet.
@@ -734,6 +748,14 @@ public class ConnectionProxyXA extends AbstractConnectionProxyXA implements Hold
                 // recoverInput its resend shortcut -- the entry is then found unprepared and re-executed,
                 // which is safe -- whereas losing the report is the failure this whole block exists to
                 // prevent.
+                //
+                // Record the failure for the application thread as well. The SQLException thrown at the end
+                // of this block is swallowed by Spring's DataSourceUtils.releaseConnection (this method runs
+                // from doCleanupAfterCompletion), so without this marker the activation returns normally and
+                // the root commits over a branch that has just voted no. See ActaContext.Phase1Failure.
+                if (actaEnabled) {
+                    ActaContext.recordPhase1Failure(xaBranchXid.toString(), xe);
+                }
                 if (actaEnabled) {
                     try {
                         ActaRuntime.get(resource.getDbType()).markNoVoting(actaInId);

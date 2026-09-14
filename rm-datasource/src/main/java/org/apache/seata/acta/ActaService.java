@@ -432,6 +432,42 @@ public final class ActaService {
         return e == null ? null : e.msg.id;
     }
 
+    /**
+     * Make sure this input is definitively aborted and the coordinator has been
+     * told -- Figure 3 lines 26-27, for a caller that is NOT inside the XA branch.
+     *
+     * The receiving endpoint calls this when an activation body throws. In the
+     * normal case there is nothing left to do: Spring has already rolled the
+     * local transaction back, and ConnectionProxyXA.rollback() ran
+     * markNoVoting -> reportStatusToTC(PhaseOne_Failed) -> markNoVoted on its way
+     * out, so the entry is already at noVote=VOTED. This method exists for the
+     * cases where that did NOT happen -- the failure was raised before the branch
+     * was ever enlisted, or Acta was not installed for that engine -- where the
+     * entry would otherwise sit with no vote and no decision, and the coordinator
+     * would wait out its timeout instead of aborting promptly.
+     *
+     * Deliberately NOT {@link #abortAndVote}: that also calls
+     * {@code xa.finishTxn(tid, ABORT)} and votes unconditionally. Here the branch
+     * is already rolled back, and voting a second time for a branch that has
+     * already voted would be a protocol error -- hence the guard on noVote and
+     * phase2 both being unset, evaluated against the durable entry rather than
+     * assumed.
+     *
+     * @return true if this call is what recorded the no vote
+     */
+    public boolean ensureAbortedAndVoted(String inId) {
+        InboxEntry entry = meta.single(c -> ActaMetadata.getInbox(c, inId));
+        if (entry == null || entry.noVote != null || entry.phase2 != null) {
+            // Already voted (the usual path), already decided, or already collected.
+            return false;
+        }
+        LOGGER.debug("Acta ensureAbortedAndVoted recording a no vote for {} that the XA path did not send", inId);
+        markNoVoting(inId);
+        twoPc.voteNo(entry.msg.gtid, inId);
+        markNoVoted(inId);
+        return true;
+    }
+
     /** Lines 31-39. */
     void abortAndVote(Message in, String tid) {
         markNoVoting(in.id);
@@ -673,6 +709,29 @@ public final class ActaService {
                 try {
                     transport.receive(msg.msg.target, msg.msg);
                     ActaTiming.record(ActaTiming.Site.DELIVER_TRANSPORT_RECEIVE, System.nanoTime() - transportT0);
+                } catch (ActaActivationAbortedException aborted) {
+                    // The consumer answered, and the answer is "this activation
+                    // failed and I have voted no". Nothing was lost, so Figure 5
+                    // retransmission does not apply: retrying would re-execute the
+                    // consumer under a fresh tid until it happened to succeed and
+                    // would hide a real conflict from the client. Mark the entry
+                    // terminal and let the abort travel up to whoever owns the
+                    // global transaction -- see the exception's Javadoc.
+                    ActaTiming.record(ActaTiming.Site.DELIVER_TRANSPORT_RECEIVE, System.nanoTime() - transportT0);
+                    ActaTiming.count(ActaTiming.Site.DELIVER_CONSUMER_ABORTED);
+                    LOGGER.debug(
+                            "deliver consumer aborted t={} msgId={} tid={} reason={}",
+                            System.currentTimeMillis(),
+                            msg.msg.id,
+                            msg.tid,
+                            aborted.reason());
+                    meta.atomic(c -> {
+                        if (ActaMetadata.getOutbox(c, msg.msg.id) != null) {
+                            ActaMetadata.setDelivery(c, msg.msg.id, Delivery.FAILED);
+                        }
+                        return null;
+                    });
+                    throw aborted;
                 } catch (Exception e) {
                     ActaTiming.record(ActaTiming.Site.DELIVER_TRANSPORT_RECEIVE, System.nanoTime() - transportT0);
                     LOGGER.debug(

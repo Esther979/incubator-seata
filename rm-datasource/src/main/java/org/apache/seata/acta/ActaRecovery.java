@@ -159,6 +159,21 @@ public final class ActaRecovery {
      * FRESH message id (never a pre-existing one from this scan), so the two
      * never touch the same outbox row.
      *
+     * <h2>Invariant: a FAILED outbox entry is never retransmitted</h2>
+     *
+     * Only {@code delivery == NEW} is queued below. An entry marked
+     * {@link Delivery#FAILED} was delivered, and its consumer ABORTED the
+     * resulting activation after voting no (ActaActivationAbortedException), so
+     * the global transaction it belongs to is one the coordinator is rolling
+     * back. Redelivering it would re-execute an activation whose workflow has
+     * already been decided against -- the same class of mistake as re-executing a
+     * decided input, which recoverInput exists to prevent.
+     *
+     * FAILED is therefore terminal exactly like ACKED, and the two are treated
+     * identically here: neither is queued, and tryGcOutbox advances past both
+     * rather than blocking on them. The only difference is what they record about
+     * why the message will not be sent again.
+     *
      * Logs (INFO): one summary line up front with the scanned/considered
      * counts, one line per owned outbox entry (delivery state and whether it
      * was queued for retransmission), a closing summary with the dispatched

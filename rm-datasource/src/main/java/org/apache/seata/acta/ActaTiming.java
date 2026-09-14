@@ -98,7 +98,21 @@ public final class ActaTiming {
         DELIVER_IS_PREPARED,
 
         /** deliver()'s transport.receive() call: the network hop plus the whole synchronous downstream activation it triggers. */
-        DELIVER_TRANSPORT_RECEIVE
+        DELIVER_TRANSPORT_RECEIVE,
+
+        /**
+         * Deliveries the CONSUMER aborted (HTTP 409, ActaActivationAbortedException):
+         * the activation failed locally and voted no, so the message was marked
+         * FAILED and never retried. Counted, not timed.
+         *
+         * This is the number that used to be invisible. Before the abort path
+         * existed every one of these was swallowed by deliver()'s backoff loop and
+         * re-executed until it succeeded, so the client saw latency instead of a
+         * failed workflow. It should track the load generator's retryable-failure
+         * count for the same run; a large gap means aborts are still being absorbed
+         * somewhere.
+         */
+        DELIVER_CONSUMER_ABORTED
     }
 
     private static final Map<Site, AtomicLong> NANOS = new EnumMap<>(Site.class);
